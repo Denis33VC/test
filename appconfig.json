@@ -1,0 +1,8 @@
+{
+	"host": "192.168.19.138", 
+	"port": 5432, 
+	"dbname": "app", 
+	"user": "postgres", 
+	"password": "postgres",
+	"rest" : "http://ws.st:5000"
+}
