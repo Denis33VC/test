@@ -1,0 +1,194 @@
+<?php
+require_once('elah2.php');
+require('f_is_db.php');
+
+// Подключение автозагрузчика Composer для PhpSpreadsheet
+// Убедитесь, что путь соответствует вашей структуре папок
+if (file_exists('vendor/autoload.php')) {
+    require 'vendor/autoload.php';
+} else {
+    // Попытка найти autoload в родительской директории, если нужно
+    if (file_exists('../vendor/autoload.php')) {
+        require '../vendor/autoload.php';
+    } else {
+        echo json_encode(['success' => false, 'msg' => 'Composer autoload not found. Please run "composer require phpoffice/phpspreadsheet"']);
+        exit;
+    }
+}
+
+use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Shared\Date;
+
+$bd = is_db();
+$conn = Connect('db');
+
+if (!$conn) {
+    echo json_encode(['success' => false, 'msg' => 'Database connection failed']);
+    exit;
+}
+
+// Проверка наличия файла
+if (!isset($_FILES["file"]) || $_FILES["file"]["error"] > 0) {
+    $error = isset($_FILES["file"]) ? $_FILES["file"]["error"] : 'No file uploaded';
+    echo json_encode(['success' => false, 'msg' => $error]);
+    Disconnect($conn);
+    exit;
+}
+
+$file_name_tmp = $_FILES["file"]["tmp_name"];
+$dt = date('d.m.Y');
+
+try {
+    // 1. Очистка таблицы
+    $sql_del = "DELETE FROM ak101.ak101e03";
+    $res_del = pg_query($conn, $sql_del);
+    if (!$res_del) {
+        throw new Exception("DB Cleanup Error: " . pg_last_error($conn));
+    }
+
+    // 2. Получение ID пользователя
+    $sql_p704 = "SELECT data.get_user() as p704";
+    $res_p704 = pg_query($conn, $sql_p704);
+    $p704 = null;
+    if ($res_p704) {
+        $row_str_p704 = pg_fetch_assoc($res_p704);
+        if ($row_str_p704) {
+            $p704 = $row_str_p704["p704"];
+        }
+    }
+
+    if ($p704 === null) {
+        throw new Exception("Could not retrieve User ID from database");
+    }
+
+    // 3. Загрузка Excel файла
+    $spreadsheet = IOFactory::load($file_name_tmp);
+    $highestRowGlobal = 0;
+
+    // Подготовка SQL запроса (Prepared Statement) для безопасности и производительности
+    // Параметры: $1=c623, $2=x20602, $3=x497, $4=x48002, $5=x470022, $6=x470023, $7=x364(dt), $8=p704, $9=x368(date_val)
+    $stmt_name = "insert_ak101_stmt";
+    $sql_insert = "INSERT INTO ak101.ak101e03(c623, x20602, x497, x48002, x470022, x470023, x364, p704, x368) 
+                   VALUES($1, $2, $3, $4, $5, $6, to_date($7, 'dd.mm.yyyy'), $8, to_date($9, 'dd.mm.yyyy'))";
+    
+    // Проверяем, не подготовлен ли уже запрос (на случай множественных вызовов в рамках одного процесса, хотя здесь это редкость)
+    // В простом скрипте можно сразу готовить, но pg_prepare выдаст ошибку если имя занято. 
+    // Для простоты используем уникальное имя или проверяем.
+    // Так как скрипт выполняется один раз, просто готовим.
+    pg_prepare($conn, $stmt_name, $sql_insert);
+
+    foreach ($spreadsheet->getWorksheetIterator() as $worksheet) {
+        $highestRow = $worksheet->getHighestRow();
+        $highestColumn = $worksheet->getHighestColumn();
+        $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
+
+        // Начинаем с 6-й строки, как в оригинале
+        for ($row = 6; $row <= $highestRow; ++$row) {
+            $val = [];
+            
+            // Читаем все ячейки строки
+            for ($col = 0; $col < $highestColumnIndex; ++$col) {
+                // getCellByColumnAndRow принимает (columnIndex 0-based, rowNumber 1-based)
+                $cell = $worksheet->getCellByColumnAndRow($col, $row);
+                $val[] = $cell->getValue();
+            }
+
+            // Гарантируем наличие индексов, чтобы избежать ошибок "Undefined array key" в PHP 8.3
+            while (count($val) < 11) {
+                $val[] = '';
+            }
+
+            // Обработка данных (аналогично оригиналу)
+            
+            // val[0] - очистка от апострофов
+            $v0 = isset($val[0]) ? str_replace("'", "", trim($val[0])) : '';
+            
+            // val[3], val[4], val[5] - верхний регистр
+            $v3 = isset($val[3]) ? strtoupper(trim($val[3])) : '';
+            $v4 = isset($val[4]) ? strtoupper(trim($val[4])) : '';
+            $v5 = isset($val[5]) ? strtoupper(trim($val[5])) : '';
+            
+            // val[7] - очистка от апострофов
+            $v7 = isset($val[7]) ? str_replace("'", "", trim($val[7])) : '';
+            
+            // val[2]
+            $v2 = isset($val[2]) ? trim($val[2]) : '';
+
+            // Обработка даты val[10]
+            $dateValStr = '';
+            if (isset($val[10]) && !empty($val[10])) {
+                $rawDate = $val[10];
+                
+                // Если это число (Excel serial date)
+                if (is_numeric($rawDate)) {
+                    try {
+                        $dateTime = Date::excelToDateTimeObject($rawDate);
+                        $dateValStr = $dateTime->format('d.m.Y');
+                    } catch (\Exception $e) {
+                        $dateValStr = ''; // Ошибка конвертации
+                    }
+                } 
+                // Если это строка
+                elseif (is_string($rawDate)) {
+                    $cleanDate = str_replace("'", "", trim($rawDate));
+                    // Пробуем распарсить дату
+                    $timestamp = strtotime($cleanDate);
+                    if ($timestamp !== false) {
+                        $dateValStr = date("d.m.Y", $timestamp);
+                    } else {
+                        // Если не удалось распознать, оставляем как есть (надеясь, что PostgreSQL поймет или вернет ошибку)
+                        $dateValStr = $cleanDate;
+                    }
+                }
+            }
+
+            // Выполнение подготовленного запроса
+            $result = pg_execute($conn, $stmt_name, [
+                $v0,    // c623
+                $v7,    // x20602
+                $v5,    // x497
+                $v2,    // x48002
+                $v3,    // x470022
+                $v4,    // x470023
+                $dt,    // x364 (текущая дата загрузки)
+                $p704,  // p704
+                $dateValStr // x368 (дата из файла)
+            ]);
+
+            if (!$result) {
+                // Можно логировать ошибку, но не прерывать весь процесс, если одна строка битая
+                // error_log("Row $row insert error: " . pg_last_error($conn));
+            }
+        }
+        
+        if ($highestRow > $highestRowGlobal) {
+            $highestRowGlobal = $highestRow;
+        }
+    }
+
+    // Формирование ответа
+    $file_name_real = $_FILES["file"]["name"];
+    $file_size = round($_FILES["file"]["size"] / 1024, 2) . " KBytes";
+    
+    // Количество обработанных строк (минус заголовки 5 строк)
+    $processedRows = $highestRowGlobal > 5 ? $highestRowGlobal - 5 : 0;
+
+    $response = [
+        'success' => true,
+        'data' => [
+            'name' => $file_name_real, 
+            'size' => $file_size
+        ],
+        'msg' => " $processedRows"
+    ];
+    
+    echo json_encode($response);
+
+} catch (\PhpOffice\PhpSpreadsheet\Exception $e) {
+    echo json_encode(['success' => false, 'msg' => 'Excel Error: ' . $e->getMessage()]);
+} catch (\Exception $e) {
+    echo json_encode(['success' => false, 'msg' => 'Error: ' . $e->getMessage()]);
+} finally {
+    Disconnect($conn);
+}
+?>

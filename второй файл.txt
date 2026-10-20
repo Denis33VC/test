@@ -1,0 +1,130 @@
+<?php
+require_once('elah2.php');
+require('f_is_db.php');
+
+// Подключение автозагрузчика Composer для PhpSpreadsheet
+if (file_exists('vendor/autoload.php')) {
+    require 'vendor/autoload.php';
+} elseif (file_exists('../vendor/autoload.php')) {
+    require '../vendor/autoload.php';
+} else {
+    echo json_encode(['success' => false, 'msg' => 'Composer autoload not found.']);
+    exit;
+}
+
+use PhpOffice\PhpSpreadsheet\IOFactory;
+
+$bd = is_db();
+$conn = Connect('db');
+
+if (!$conn) {
+    echo json_encode(['success' => false, 'msg' => 'Database connection failed']);
+    exit;
+}
+
+// Проверка наличия файла
+if (!isset($_FILES["file"]) || $_FILES["file"]["error"] > 0) {
+    $error = isset($_FILES["file"]) ? $_FILES["file"]["error"] : 'No file uploaded';
+    echo json_encode(['success' => false, 'msg' => $error]);
+    Disconnect($conn);
+    exit;
+}
+
+$file_name_tmp = $_FILES["file"]["tmp_name"];
+
+try {
+    // 1. Очистка таблицы
+    $sql_del = "DELETE FROM ak101.ak101e28";
+    $res_del = pg_query($conn, $sql_del);
+    if (!$res_del) {
+        throw new Exception("DB Cleanup Error: " . pg_last_error($conn));
+    }
+
+    // 2. Загрузка Excel файла
+    $spreadsheet = IOFactory::load($file_name_tmp);
+    $highestRowGlobal = 0;
+
+    // Подготовка SQL запроса (Prepared Statement)
+    // Параметры: $1=id_e28, $2=p763, $3=x802
+    $stmt_name = "insert_ak101_e28_stmt";
+    $sql_insert = "INSERT INTO ak101.ak101e28(id_e28, p763, x802, x368) VALUES($1, $2, $3, now())";
+    
+    pg_prepare($conn, $stmt_name, $sql_insert);
+
+    foreach ($spreadsheet->getWorksheetIterator() as $worksheet) {
+        $highestRow = $worksheet->getHighestRow();
+        $highestColumn = $worksheet->getHighestColumn();
+        $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
+
+        // Начинаем с 4-й строки, как в оригинале
+        for ($row = 4; $row <= $highestRow; ++$row) {
+            $val = [];
+            
+            // Читаем ячейки строки
+            for ($col = 0; $col < $highestColumnIndex; ++$col) {
+                $cell = $worksheet->getCellByColumnAndRow($col, $row);
+                $val[] = $cell->getValue();
+            }
+
+            // Гарантируем наличие индексов 0, 1, 2
+            while (count($val) < 3) {
+                $val[] = '';
+            }
+
+            // Обработка данных согласно оригиналу
+            // val[0] - ID (число или строка)
+            $v0 = isset($val[0]) ? $val[0] : null;
+            
+            // val[1] - trim
+            $v1 = isset($val[1]) ? trim($val[1]) : '';
+            
+            // val[2] - remove apostrophes
+            $v2 = isset($val[2]) ? str_replace("'", "", $val[2]) : '';
+
+            // Выполнение подготовленного запроса
+            // Приводим v0 к типу, если ожидается число, но pg_execute справится со строкой тоже
+            $result = pg_execute($conn, $stmt_name, [
+                $v0,
+                $v1,
+                $v2
+            ]);
+
+            if (!$result) {
+                // Логирование ошибки вставки конкретной строки
+                // error_log("Row $row insert error: " . pg_last_error($conn));
+            }
+        }
+        
+        if ($highestRow > $highestRowGlobal) {
+            $highestRowGlobal = $highestRow;
+        }
+    }
+
+    // Формирование ответа
+    $file_name_real = $_FILES["file"]["name"];
+    $file_size = round($_FILES["file"]["size"] / 1024, 2) . " KBytes";
+    
+    // В оригинале было msg => ' '.$highestRow-6. 
+    // Так как цикл начинался с 4, а не с 6, возможно, тут опечатка в оригинале или специфическая логика.
+    // Оставим как в оригинале: highestRowGlobal - 6
+    $processedRows = $highestRowGlobal > 6 ? $highestRowGlobal - 6 : 0;
+
+    $response = [
+        'success' => true,
+        'data' => [
+            'name' => $file_name_real, 
+            'size' => $file_size
+        ],
+        'msg' => " $processedRows"
+    ];
+    
+    echo json_encode($response);
+
+} catch (\PhpOffice\PhpSpreadsheet\Exception $e) {
+    echo json_encode(['success' => false, 'msg' => 'Excel Error: ' . $e->getMessage()]);
+} catch (\Exception $e) {
+    echo json_encode(['success' => false, 'msg' => 'Error: ' . $e->getMessage()]);
+} finally {
+    Disconnect($conn);
+}
+?>
